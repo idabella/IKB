@@ -39,22 +39,33 @@ class RagTool(BaseTool):
         "required": ["query"]
     }
 
-    def __init__(self, rag_client: Any = None):
+    def __init__(self, rag_client: Any = None) -> None:
         self.rag_client = rag_client  # Inject gRPC/REST client
 
     async def _execute_impl(self, params: Dict[str, Any]) -> Any:
-        logger.info("Executing RAG Search with query: '%s'", params.get("query"))
+        if self.rag_client is None:
+            raise RuntimeError("RagTool: rag_client is not configured")
+
+        query = params.get("query")
+        if not query:
+            raise ValueError("Query is required for RagTool")
+
+        logger.info("Executing RAG Search with query: '%s'", query)
         
-        # Mocking the network call to the rag_service
-        if not self.rag_client:
-            return [
-                {
-                    "text": "To replace the spindle bearing on a CNC machine, first disconnect power...",
-                    "source_doc": "CNC_Manual_v2.pdf",
-                    "score": 0.95
-                }
-            ]
-            
-        # Actual client call would go here
-        # return await self.rag_client.retrieve_context(...)
-        return []
+        body = {
+            "query": query,
+            "top_k": params.get("top_k", 5),
+            "filters": {
+                "machine_ids": params.get("machine_ids"),
+                "doc_types": params.get("doc_types")
+            }
+        }
+        
+        try:
+            response = await self.rag_client.post("/api/v1/retrieve", json=body)
+            response.raise_for_status()
+            data = response.json()
+            return data.get("chunks", [])
+        except Exception as e:
+            logger.error("RagTool execution failed: %s", str(e))
+            raise ValueError(f"Failed to fetch RAG context: {str(e)}")
