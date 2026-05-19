@@ -1,120 +1,77 @@
 import asyncio
-import json
 import logging
-import time
-from typing import Any, Dict
+import os
+from typing import Callable, List, Awaitable
 
 import aiomqtt
-
-from backend.shared.infrastructure.messaging.kafka_producer import KafkaMessageProducer
 
 logger = logging.getLogger(__name__)
 
 
 class MQTTConnector:
     """
-    MQTT Connector using aiomqtt.
-    Subscribes to 'factory/+/sensors/#' pattern and publishes to Kafka.
+    Async MQTT Connector using aiomqtt.
+    Manages persistent connection, subscriptions, and delegates messages to an injected handler.
     """
 
-    def __init__(
-        self,
-        broker_url: str,
-        tenant_id: str,
-        factory_id: str,
-        kafka_producer: KafkaMessageProducer,
-        topic_pattern: str = "factory/+/sensors/#",
-        port: int = 1883
-    ):
-        self.broker_url = broker_url
-        self.port = port
-        self.topic_pattern = topic_pattern
-        self.tenant_id = tenant_id
-        self.factory_id = factory_id
-        self.kafka_producer = kafka_producer
+    def __init__(self, message_handler: Callable[[str, bytes], Awaitable[None]]) -> None:
+        self.host = os.environ.get("MQTT_HOST", "localhost")
+        self.port = int(os.environ.get("MQTT_PORT", "1883"))
+        self.username = os.environ.get("MQTT_USERNAME")
+        self.password = os.environ.get("MQTT_PASSWORD")
+        self.client_id = os.environ.get("MQTT_CLIENT_ID", "")
+        
+        topics_env = os.environ.get("MQTT_TOPICS", "factory/+/sensors/#")
+        self.topics: List[str] = [t.strip() for t in topics_env.split(",") if t.strip()]
+        
+        self.message_handler = message_handler
         self._running = False
-        self._loop_task: asyncio.Task | None = None
 
-    async def start(self) -> None:
+    async def connect(self) -> None:
+        """
+        Connects to the MQTT broker, subscribes to topics, and listens for messages.
+        Implements automatic reconnect with exponential backoff.
+        """
         self._running = True
-        self._loop_task = asyncio.create_task(self._monitor_loop())
-        logger.info("MQTT connector started for %s", self.broker_url)
-
-    async def stop(self) -> None:
-        self._running = False
-        if self._loop_task:
-            self._loop_task.cancel()
-            try:
-                await self._loop_task
-            except asyncio.CancelledError:
-                pass
-        logger.info("MQTT connector stopped for %s", self.broker_url)
-
-    async def _monitor_loop(self) -> None:
         backoff = 1.0
-        max_backoff = 60.0
+        max_backoff = 30.0
 
         while self._running:
             try:
-                logger.info("Connecting to MQTT broker %s:%d", self.broker_url, self.port)
-                async with aiomqtt.Client(hostname=self.broker_url, port=self.port) as client:
-                    backoff = 1.0  # Reset backoff
+                logger.info("Connecting to MQTT broker %s:%d...", self.host, self.port)
+                async with aiomqtt.Client(
+                    hostname=self.host,
+                    port=self.port,
+                    username=self.username,
+                    password=self.password,
+                    client_id=self.client_id or None
+                ) as client:
+                    backoff = 1.0  # Reset backoff on successful connect
+                    logger.info("Successfully connected to MQTT broker.")
                     
-                    await client.subscribe(self.topic_pattern)
-                    logger.info("Subscribed to MQTT pattern: %s", self.topic_pattern)
+                    for topic in self.topics:
+                        await client.subscribe(topic, qos=1)
+                        logger.info("Subscribed to MQTT topic: %s", topic)
 
                     async for message in client.messages:
                         if not self._running:
                             break
-                        
-                        await self._process_message(message)
-                        
+                        try:
+                            await self.message_handler(str(message.topic), message.payload)
+                        except Exception as e:
+                            logger.error("Error handling MQTT message on %s: %s", str(message.topic), str(e))
+                            
             except aiomqtt.MqttError as e:
-                logger.error("MQTT connection error: %s. Reconnecting in %.1f seconds...", e, backoff)
+                logger.warning("MQTT connection error: %s. Reconnecting in %.1fs...", str(e), backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
             except Exception as e:
-                logger.error("Unexpected error in MQTT loop: %s", e)
+                logger.error("Unexpected error in MQTT loop: %s", str(e))
                 await asyncio.sleep(5.0)
 
-    async def _process_message(self, message: aiomqtt.Message) -> None:
-        try:
-            topic = str(message.topic)
-            # Expected pattern: factory/{machine_id}/sensors/{sensor_name}
-            parts = topic.split("/")
-            if len(parts) >= 4:
-                machine_id = parts[1]
-                sensor_name = parts[3]
-            else:
-                machine_id = "unknown"
-                sensor_name = "unknown"
-
-            payload_raw = message.payload
-            if isinstance(payload_raw, bytes):
-                payload_raw = payload_raw.decode("utf-8")
-                
-            try:
-                data = json.loads(payload_raw)
-                val = data.get("value", payload_raw)
-            except json.JSONDecodeError:
-                val = payload_raw
-
-            kafka_payload = {
-                "sensor_id": sensor_name,
-                "machine_id": machine_id,
-                "metric_name": sensor_name,
-                "value": float(val) if isinstance(val, (int, float, str)) and str(val).replace('.','',1).isdigit() else val,
-                "unit": "unknown",
-                "timestamp": time.time() * 1000,
-                "quality": 0,
-                "tenant_id": self.tenant_id,
-                "factory_id": self.factory_id
-            }
-
-            await self.kafka_producer.send(
-                topic="ikb.sensors.raw",
-                value=kafka_payload,
-                key=sensor_name  # Partition key = sensor_id
-            )
-        except Exception as e:
-            logger.error("Error processing MQTT message from topic %s: %s", message.topic, e)
+    def disconnect(self) -> None:
+        """
+        Signals the connector to gracefully stop listening and disconnect.
+        """
+        logger.info("Disconnecting MQTT connector...")
+        self._running = False
