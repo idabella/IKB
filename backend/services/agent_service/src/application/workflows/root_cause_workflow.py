@@ -5,6 +5,7 @@ from typing import Annotated, Dict, List, TypedDict
 from langgraph.graph import StateGraph, END
 from backend.services.agent_service.src.domain.models.agent_task import AgentTask
 from backend.services.agent_service.src.infrastructure.tools.telemetry_tool import TelemetryTool
+from backend.services.agent_service.src.infrastructure.tools.rag_tool import RagTool
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,37 @@ async def retrieve_telemetry(state: RCAWorkflowState) -> RCAWorkflowState:
 
 async def retrieve_knowledge(state: RCAWorkflowState) -> RCAWorkflowState:
     logger.info("Workflow: Retrieving Knowledge (RAG)")
-    state["knowledge_docs"] = "Mock RAG: Bearing wear often preceded by vibration spikes."
+    
+    task = state.get("task")
+    if not task:
+        state["knowledge_docs"] = "Error: No task provided in state."
+        return state
+        
+    query = task.query
+    if not query:
+        state["knowledge_docs"] = "Error: Task query is empty."
+        return state
+
+    # Note: RagTool should be dependency-injected in production.
+    # Instantiating directly for now.
+    tool = RagTool()
+    
+    params = {
+        "query": query,
+        "top_k": 3
+    }
+    
+    try:
+        result = await tool.execute(params)
+        if result.success:
+            state["knowledge_docs"] = str(result.data)
+        else:
+            logger.error("RagTool returned failure: %s", result.error)
+            state["knowledge_docs"] = f"Error retrieving knowledge: {result.error}"
+    except Exception as exc:
+        logger.error("Exception during RagTool execution: %s", exc)
+        state["knowledge_docs"] = f"Error retrieving knowledge: {exc}"
+        
     return state
 
 
