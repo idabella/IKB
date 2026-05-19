@@ -70,5 +70,19 @@ class TelemetryRedisCache:
         await self.redis.setex(key, ttl_seconds, json.dumps(rule_data))
         
     async def get_machine_rules(self, machine_id: str) -> List[Dict[str, Any]]:
-        """Mock method: In production this would query Redis Sets of rule IDs."""
-        return []
+        """Fetch cached alerting rules for a machine from Redis."""
+        try:
+            rule_ids = await self.redis.smembers(f"ikb:machine_rules:{machine_id}")
+            if not rule_ids:
+                return []
+                
+            rules = []
+            for rule_id in rule_ids:
+                rule_data = await self.redis.get(f"ikb:rule:{rule_id.decode('utf-8')}")
+                if rule_data is not None:
+                    rules.append(json.loads(rule_data))
+                    
+            return rules
+        except Exception as e:
+            logger.error("Failed to fetch machine rules for %s: %s", machine_id, str(e))
+            raise e
