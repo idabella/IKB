@@ -10,10 +10,13 @@ class EpisodicMemory:
     """
     Redis-backed conversational memory for agents.
     Implements a sliding window (max 50 turns) and 8-hour shift-based TTL.
+    Uses LLM-powered summarization to compress older turns while preserving
+    key diagnostic findings, actions taken, anomalies, and machine IDs.
     """
 
-    def __init__(self, redis_client: Redis, max_turns: int = 50, ttl_seconds: int = 28800):
+    def __init__(self, redis_client: Redis, llm_client: Any, max_turns: int = 50, ttl_seconds: int = 28800) -> None:
         self.redis_client = redis_client
+        self.llm_client = llm_client
         self.max_turns = max_turns
         self.ttl_seconds = ttl_seconds
 
@@ -51,36 +54,60 @@ class EpisodicMemory:
 
     async def summarize_if_needed(self, session_id: str, current_token_count: int, threshold: int = 4096) -> None:
         """
-        Auto-summarize when >80% token budget (e.g. 4096 tokens).
-        Compresses old turns, keeps the last 10 verbatim.
+        Auto-summarize when token budget is exceeded.
+        Compresses old turns via LLM, keeps the last 10 verbatim.
+        On LLM failure, retains original messages (graceful degradation).
         """
         if current_token_count < threshold:
             return
             
-        logger.info("Token budget exceeded threshold (%d) for session %s. Summarizing...", current_token_count, session_id)
         history = await self.get_history(session_id)
         
         if len(history) <= 10:
-            return  # Too few messages to summarize
+            return
             
         old_msgs = history[:-10]
         recent_msgs = history[-10:]
         
-        # Mock summarization logic - in production, call an LLM
-        summary_text = f"[SYSTEM SUMMARIZED CONTEXT]: User discussed {len(old_msgs)} prior actions..."
+        # Build the conversation transcript for summarization
+        transcript_lines = [f"{msg['role']}: {msg['content']}" for msg in old_msgs]
+        transcript = "\n".join(transcript_lines)
         
-        summarized_msg = {
+        prompt = (
+            "You are a senior industrial diagnostics assistant. Summarize the following "
+            "diagnostic conversation history into a concise context summary. Preserve:\n"
+            "- Key diagnostic findings and conclusions\n"
+            "- Actions taken or recommended\n"
+            "- Anomalies and faults detected\n"
+            "- All machine IDs, sensor IDs, and equipment references mentioned\n"
+            "- Any unresolved issues or pending investigations\n\n"
+            "Be concise but do not omit critical technical details.\n\n"
+            f"Conversation ({len(old_msgs)} messages):\n{transcript}"
+        )
+        
+        try:
+            summary = await self.llm_client.complete(prompt)
+            logger.info(
+                "Summarized %d messages for session %s (token count was %d).",
+                len(old_msgs), session_id, current_token_count
+            )
+        except Exception as e:
+            logger.warning(
+                "LLM summarization failed for session %s, retaining original messages: %s",
+                session_id, str(e)
+            )
+            return
+        
+        summarized_msg: Dict[str, Any] = {
             "role": "system",
-            "content": summary_text,
-            "metadata": {"type": "summary"}
+            "content": f"[DIAGNOSTIC SESSION CONTEXT SUMMARY]\n{summary}",
+            "metadata": {"type": "summary", "summarized_count": len(old_msgs)}
         }
         
         key = self._key(session_id)
-        # Rebuild list
         await self.redis_client.delete(key)
         
         new_list = [summarized_msg] + recent_msgs
-        
         for msg in new_list:
             await self.redis_client.rpush(key, json.dumps(msg))
             
