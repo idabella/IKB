@@ -1,8 +1,10 @@
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Dict, List, TypedDict
 
 from langgraph.graph import StateGraph, END
 from backend.services.agent_service.src.domain.models.agent_task import AgentTask
+from backend.services.agent_service.src.infrastructure.tools.telemetry_tool import TelemetryTool
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +29,42 @@ async def route_query(state: RCAWorkflowState) -> RCAWorkflowState:
 
 async def retrieve_telemetry(state: RCAWorkflowState) -> RCAWorkflowState:
     logger.info("Workflow: Retrieving Telemetry")
-    state["telemetry_data"] = "Mock Telemetry: Temperature normal, Vibration spike 2 hrs ago."
+    task = state.get("task")
+    if not task:
+        state["telemetry_data"] = "Error: No task provided in state."
+        return state
+
+    machine_id = task.metadata.get("machine_id")
+    if not machine_id:
+        state["telemetry_data"] = "No telemetry retrieved: 'machine_id' missing from task metadata."
+        return state
+
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=2)
+
+    # Note: TelemetryTool should be dependency-injected in production.
+    # Instantiating directly for now.
+    tool = TelemetryTool()
+
+    params = {
+        "machine_id": machine_id,
+        "metric_names": ["temperature", "vibration"],
+        "start_time": start.isoformat(),
+        "end_time": now.isoformat(),
+        "aggregation": "mean"
+    }
+
+    try:
+        result = await tool.execute(params)
+        if result.success:
+            state["telemetry_data"] = str(result.data)
+        else:
+            logger.error("TelemetryTool returned failure: %s", result.error)
+            state["telemetry_data"] = f"Error retrieving telemetry: {result.error}"
+    except Exception as exc:
+        logger.error("Exception during TelemetryTool execution: %s", exc)
+        state["telemetry_data"] = f"Error retrieving telemetry: {exc}"
+
     return state
 
 
