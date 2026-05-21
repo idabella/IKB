@@ -14,6 +14,8 @@ class HybridRetriever:
     """
     Production Hybrid Retriever utilizing Qdrant for semantic and filtered search.
     """
+    
+
     def __init__(self, qdrant_client: AsyncQdrantClient, embedder: Any) -> None:
         self.qdrant = qdrant_client
         self.embedder = embedder
@@ -85,5 +87,9 @@ class HybridRetriever:
             return results
 
         except Exception as e:
-            logger.error("HybridRetriever failed to retrieve context: %s", str(e))
-            return []
+            logger.error(
+                "HybridRetriever failed to retrieve context: %s",
+                str(e),
+                exc_info=True,
+            )
+            raise RuntimeError(f"Hybrid retrieval failed: {str(e)}") from e
