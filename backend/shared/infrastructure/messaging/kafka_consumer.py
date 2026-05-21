@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import signal
+import os
 from typing import Any, Awaitable, Callable
 
 import orjson
-from aiokafka import AIOKafkaConsumer, ConsumerRecord
-from pydantic import BaseModel
+from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, ConsumerRecord
+from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +15,10 @@ MessageHandler = Callable[[dict[str, Any], dict[str, str]], Awaitable[None]]
 
 
 class KafkaConsumerConfig(BaseModel):
-    bootstrap_servers: str = "localhost:9092"
+    # Production: set KAFKA_BOOTSTRAP_SERVERS=kafka:9092 in container env
+    bootstrap_servers: str = Field(
+        default_factory=lambda: os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "kafka:9092")
+    )
     group_id: str = "ikb-consumer-group"
     auto_offset_reset: str = "earliest"
     enable_auto_commit: bool = False
@@ -35,6 +38,7 @@ class KafkaMessageConsumer:
         config: KafkaConsumerConfig | None = None,
         dead_letter_topic: str | None = None,
         max_retries: int = 3,
+        retry_topic: str | None = None,
     ) -> None:
         self._topics = topics
         self._handler = handler
@@ -43,6 +47,9 @@ class KafkaMessageConsumer:
         self._running = False
         self._dead_letter_topic = dead_letter_topic
         self._max_retries = max_retries
+        # If no retry topic supplied, derive one from the first subscribed topic.
+        # Callers managing multiple topics should supply an explicit retry_topic.
+        self._retry_topic: str = retry_topic or f"{topics[0]}.retry"
 
     async def start(self) -> None:
         self._consumer = AIOKafkaConsumer(
@@ -60,9 +67,10 @@ class KafkaMessageConsumer:
         await self._consumer.start()
         self._running = True
         logger.info(
-            "Kafka consumer started — topics=%s group=%s",
+            "Kafka consumer started — topics=%s group=%s retry_topic=%s",
             self._topics,
             self._config.group_id,
+            self._retry_topic,
         )
 
     async def stop(self) -> None:
@@ -86,8 +94,16 @@ class KafkaMessageConsumer:
             await self.stop()
 
     async def _process_record(self, record: ConsumerRecord) -> None:
-        headers = {k: v.decode() for k, v in (record.headers or [])}
-        retry_count = int(headers.get("x-retry-count", "0"))
+        # Decode headers once; keep raw dict for safe int conversion from bytes.
+        raw_headers: dict[str, bytes] = {
+            k: v for k, v in (record.headers or [])
+        }
+        headers: dict[str, str] = {
+            k: v.decode() for k, v in raw_headers.items()
+        }
+
+        # Safely extract retry count — header value arrives as bytes from Kafka.
+        retry_count: int = int(raw_headers.get("x-retry-count", b"0"))
 
         try:
             await self._handler(record.value, headers)
@@ -98,18 +114,110 @@ class KafkaMessageConsumer:
                 record.partition,
                 record.offset,
             )
+
         except Exception:
             logger.exception(
-                "Error processing message from %s [partition=%d offset=%d] (retry %d/%d)",
+                "Error processing message from %s [partition=%d offset=%d] "
+                "(retry %d/%d)",
                 record.topic,
                 record.partition,
                 record.offset,
                 retry_count,
                 self._max_retries,
             )
-            if retry_count >= self._max_retries and self._dead_letter_topic:
-                await self._send_to_dead_letter(record, headers, retry_count)
+
+            if retry_count < self._max_retries:
+                # ── RETRY PATH ────────────────────────────────────────────
+                # Re-publish to the retry topic with an incremented counter.
+                # Do NOT commit the offset here; if the re-publish itself
+                # fails we fall through so the message is not silently lost.
+                await self._republish_for_retry(record, headers, retry_count)
+
+            else:
+                # ── EXHAUSTED PATH ────────────────────────────────────────
+                if self._dead_letter_topic:
+                    # DLQ configured: park the message and move on.
+                    await self._send_to_dead_letter(record, headers, retry_count)
+                else:
+                    # No DLQ: we have no safe place for this message.
+                    logger.critical(
+                        "Message permanently lost — no DLQ configured and retries "
+                        "exhausted. topic=%s partition=%d offset=%d key=%s",
+                        record.topic,
+                        record.partition,
+                        record.offset,
+                        record.key,
+                    )
+
+                # Commit in both exhausted sub-cases to unblock the consumer.
+                await self._consumer.commit()
+
+    async def _republish_for_retry(
+        self,
+        record: ConsumerRecord,
+        headers: dict[str, str],
+        retry_count: int,
+    ) -> None:
+        """Re-publish a failed message to the retry topic with an incremented
+        x-retry-count header.  Offset is intentionally NOT committed so that
+        a re-publish failure does not cause silent message loss — the caller's
+        exception handler will fall through to DLQ/commit instead.
+        """
+        producer: AIOKafkaProducer | None = None
+
+        try:
+            # Rebuild headers, overwriting x-retry-count with the new value.
+            new_headers: list[tuple[str, bytes]] = [
+                (k, v.encode() if isinstance(v, str) else v)
+                for k, v in headers.items()
+                if k != "x-retry-count"
+            ]
+            new_headers.append(("x-retry-count", str(retry_count + 1).encode()))
+            new_headers.append(("x-original-topic", record.topic.encode()))
+
+            producer = AIOKafkaProducer(
+                bootstrap_servers=self._config.bootstrap_servers,
+            )
+            await producer.start()
+
+            await producer.send_and_wait(
+                topic=self._retry_topic,
+                value=record.value,
+                key=record.key,
+                headers=new_headers,
+            )
+
+            logger.info(
+                "Re-published message to retry topic %s "
+                "[original_topic=%s partition=%d offset=%d retry=%d/%d]",
+                self._retry_topic,
+                record.topic,
+                record.partition,
+                record.offset,
+                retry_count + 1,
+                self._max_retries,
+            )
+            # Offset deliberately not committed — Kafka will not redeliver
+            # because we have re-queued the work on the retry topic ourselves.
             await self._consumer.commit()
+
+        except Exception:
+            # Re-publish failed: log and do NOT commit so the original message
+            # is redelivered by Kafka on the next poll.
+            logger.error(
+                "Failed to re-publish message to retry topic %s — "
+                "offset NOT committed; Kafka will redeliver. "
+                "[original_topic=%s partition=%d offset=%d]",
+                self._retry_topic,
+                record.topic,
+                record.partition,
+                record.offset,
+                exc_info=True,
+            )
+
+        finally:
+            if producer is not None:
+                await producer.stop()
 
     async def _send_to_dead_letter(
         self,
@@ -122,6 +230,47 @@ class KafkaMessageConsumer:
             self._dead_letter_topic,
             retry_count,
         )
+
+        producer: AIOKafkaProducer | None = None
+
+        try:
+            new_headers: list[tuple[str, bytes]] = [
+                (k, v.encode() if isinstance(v, str) else v)
+                for k, v in headers.items()
+            ]
+            new_headers.append(("x-original-topic", record.topic.encode()))
+            new_headers.append(("x-retry-count", str(retry_count).encode()))
+
+            producer = AIOKafkaProducer(
+                bootstrap_servers=self._config.bootstrap_servers,
+            )
+            await producer.start()
+
+            await producer.send_and_wait(
+                topic=self._dead_letter_topic,
+                value=record.value,
+                key=record.key,
+                headers=new_headers,
+            )
+
+            logger.info(
+                "Successfully published message to DLQ topic %s "
+                "from original topic %s",
+                self._dead_letter_topic,
+                record.topic,
+            )
+
+        except Exception:
+            logger.error(
+                "Failed to publish message to DLQ topic %s from original topic %s",
+                self._dead_letter_topic,
+                record.topic,
+                exc_info=True,
+            )
+
+        finally:
+            if producer is not None:
+                await producer.stop()
 
     @staticmethod
     def _deserialize(value: bytes) -> dict[str, Any]:
