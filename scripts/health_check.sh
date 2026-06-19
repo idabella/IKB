@@ -2,8 +2,7 @@
 set -euo pipefail
 
 # ╔══════════════════════════════════════════════════════════════╗
-# ║  Factory AI Brain — Health Check Script                      ║
-# ║  Verifies all services are healthy and reachable             ║
+# ║  IKB v2.3 — Service Health Check                             ║
 # ╚══════════════════════════════════════════════════════════════╝
 
 RED='\033[0;31m'
@@ -24,7 +23,7 @@ check_http() {
 
     printf "  %-30s " "${name}"
     if response=$(curl -sf --max-time 5 "$url" 2>/dev/null); then
-        if echo "$response" | grep -q "$expected"; then
+        if echo "$response" | grep -qi "$expected"; then
             printf "${GREEN}✓ HEALTHY${NC}\n"
             PASS=$((PASS + 1))
         else
@@ -55,45 +54,36 @@ check_tcp() {
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════╗"
-echo "║  Factory AI Brain — Service Health Check                 ║"
+echo "║  IKB v2.3 — Service Health Check                         ║"
 echo "╚══════════════════════════════════════════════════════════╝"
 echo ""
 
-echo "${CYAN}── Backend Services ──${NC}"
-check_http "API Gateway"            "http://localhost:8000/health"
-check_http "RAG Service"            "http://localhost:8001/health"
-check_http "Agent Service"          "http://localhost:8002/health"
-check_http "Telemetry Service"      "http://localhost:8003/health"
-check_http "Knowledge Graph Service" "http://localhost:8004/health"
-check_http "Ingestion Service"      "http://localhost:8005/health"
+echo "${CYAN}── Backend Services (3-service architecture) ──${NC}"
+check_http "API Gateway :8000"         "http://localhost:8000/health"
+check_http "Knowledge Engine :8001"    "http://localhost:8001/health"
+check_http "Telemetry Aggregator :8002" "http://localhost:8002/health"
 echo ""
 
 echo "${CYAN}── Frontend ──${NC}"
-check_http "Next.js Frontend"       "http://localhost:3000" "html"
+check_http "Next.js Frontend :3000"    "http://localhost:3000" "Factory AI Brain"
 echo ""
 
-echo "${CYAN}── Databases ──${NC}"
-check_tcp  "PostgreSQL"             "localhost" 5432
-check_tcp  "Redis"                  "localhost" 6379
-check_tcp  "Neo4j (Bolt)"          "localhost" 7687
-check_http "Neo4j (HTTP)"          "http://localhost:7474" ""
-check_http "InfluxDB"              "http://localhost:8086/health" "pass"
-check_http "Qdrant"                "http://localhost:6333/healthz" ""
+echo "${CYAN}── Data Stores ──${NC}"
+check_tcp  "PostgreSQL/TimescaleDB"    "localhost" 5432
+check_tcp  "Redis"                     "localhost" 6379
+check_http "Qdrant"                    "http://localhost:6333/healthz" "ok"
+check_tcp  "Neo4j (Bolt)"              "localhost" 7687
+check_http "Neo4j (HTTP)"              "http://localhost:7474" ""
 echo ""
 
 echo "${CYAN}── Messaging ──${NC}"
-check_tcp  "Zookeeper"             "localhost" 2181
-check_tcp  "Kafka"                 "localhost" 9092
+check_tcp  "Kafka"                     "localhost" 9092
 echo ""
 
-echo "${CYAN}── ML Platform ──${NC}"
-check_http "MLflow"                "http://localhost:5000/health" ""
-echo ""
-
-echo "${CYAN}── Monitoring ──${NC}"
-check_http "Prometheus"            "http://localhost:9090/-/healthy" "OK"
-check_http "Grafana"               "http://localhost:3001/api/health" "ok"
-check_http "Jaeger"                "http://localhost:16686" ""
+echo "${CYAN}── Monitoring (optional) ──${NC}"
+check_http "Prometheus"                "http://localhost:9090/-/healthy" "OK"
+check_http "Grafana"                   "http://localhost:3001/api/health" "ok"
+check_http "MLflow"                    "http://localhost:5000/health" ""
 echo ""
 
 echo "════════════════════════════════════════════════════════════"
@@ -102,7 +92,7 @@ echo "════════════════════════�
 echo ""
 
 if [ "$FAIL" -gt 0 ]; then
-    echo "${RED}⚠  Some services are unhealthy. Check docker logs for details.${NC}"
+    echo "${RED}⚠  Some services are unhealthy. Check: make logs${NC}"
     exit 1
 else
     echo "${GREEN}✅ All services are healthy!${NC}"
