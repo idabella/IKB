@@ -21,13 +21,13 @@ x-backend-defaults: &backend-defaults
       condition: service_healthy
 
 services:
-  # ──────────────────────────────────────────────
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   # INFRASTRUCTURE
-  # ──────────────────────────────────────────────
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   postgres:
     <<: *service-defaults
-    image: postgres:15-alpine
+    image: timescale/timescaledb:latest-pg16
     container_name: ikb-postgres
     ports:
       - "${POSTGRES_PORT:-5432}:5432"
@@ -35,8 +35,18 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-ikb_admin}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-ikb_secret_2024}
       POSTGRES_DB: ${POSTGRES_DB:-ikb_main}
+    command: >
+      postgres
+      -c shared_preload_libraries=timescaledb
+      -c max_connections=200
+      -c shared_buffers=512MB
+      -c effective_cache_size=1536MB
+      -c work_mem=4MB
+      -c maintenance_work_mem=128MB
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/docker/migrations:/docker-migrations:ro
+      - ./infrastructure/docker/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-ikb_admin}"]
       interval: 5s
@@ -58,37 +68,30 @@ services:
       timeout: 5s
       retries: 5
 
-  zookeeper:
-    <<: *service-defaults
-    image: confluentinc/cp-zookeeper:7.5.0
-    container_name: ikb-zookeeper
-    ports:
-      - "${ZOOKEEPER_PORT:-2181}:2181"
-    environment:
-      ZOOKEEPER_CLIENT_PORT: 2181
-      ZOOKEEPER_TICK_TIME: 2000
-    volumes:
-      - zookeeper_data:/var/lib/zookeeper/data
-      - zookeeper_logs:/var/lib/zookeeper/log
-    healthcheck:
-      test: ["CMD-SHELL", "echo ruok | nc localhost 2181 | grep imok"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+  # â”€â”€ Zookeeper removed (Phase 2) â€” Kafka now runs in KRaft mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  # KRaft = Kafka Raft â€” built-in consensus, no external coordinator needed.
+  # Reduces: 1 container, 2 ports, 2 volumes (zookeeper_data, zookeeper_logs).
 
   kafka:
     <<: *service-defaults
-    image: confluentinc/cp-kafka:7.5.0
+    image: confluentinc/cp-kafka:7.6.0
     container_name: ikb-kafka
     ports:
       - "${KAFKA_PORT:-9092}:9092"
       - "29092:29092"
     environment:
-      KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # KRaft identity
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      CLUSTER_ID: ${KAFKA_CLUSTER_ID:-MkU3OEVBNTcwNTJENDM2Qk}
+      # Listeners
+      KAFKA_LISTENERS: PLAINTEXT://kafka:29092,CONTROLLER://kafka:29093,PLAINTEXT_HOST://0.0.0.0:9092
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
-      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      # Broker tuning
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
@@ -99,9 +102,6 @@ services:
       KAFKA_LOG_RETENTION_CHECK_INTERVAL_MS: 300000
     volumes:
       - kafka_data:/var/lib/kafka/data
-    depends_on:
-      zookeeper:
-        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:29092 --list"]
       interval: 10s
@@ -111,7 +111,7 @@ services:
 
   kafka-init:
     <<: *service-defaults
-    image: confluentinc/cp-kafka:7.5.0
+    image: confluentinc/cp-kafka:7.6.0
     container_name: ikb-kafka-init
     restart: "no"
     depends_on:
@@ -120,18 +120,13 @@ services:
     entrypoint: ["/bin/bash", "-c"]
     command:
       - |
-        echo "Creating Kafka topics..."
-        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic ikb.sensors.raw --partitions 32 --replication-factor 1 --config retention.ms=604800000
+        echo "Creating Kafka topics (KRaft mode)..."
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic ikb.sensors.raw       --partitions 32 --replication-factor 1 --config retention.ms=604800000
         kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic ikb.sensors.processed --partitions 16 --replication-factor 1 --config retention.ms=604800000
-        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic ikb.anomalies --partitions 8 --replication-factor 1 --config retention.ms=2592000000
-        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic ikb.agent.tasks --partitions 8 --replication-factor 1
-        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic ikb.agent.results --partitions 8 --replication-factor 1
-        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic ikb.alerts --partitions 4 --replication-factor 1 --config retention.ms=-1
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic ikb.anomalies          --partitions 8  --replication-factor 1 --config retention.ms=2592000000
+        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic ikb.alerts             --partitions 4  --replication-factor 1 --config retention.ms=-1
         kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic ikb.documents.ingestion --partitions 4 --replication-factor 1
-        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic ikb.graph.updates --partitions 4 --replication-factor 1
-        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic ikb.maintenance.events --partitions 4 --replication-factor 1
-        kafka-topics --create --if-not-exists --bootstrap-server kafka:29092 --topic ikb.audit.log --partitions 2 --replication-factor 1 --config retention.ms=-1 --config cleanup.policy=compact
-        echo "All Kafka topics created successfully."
+        echo "All Kafka topics created."
         kafka-topics --bootstrap-server kafka:29092 --list
 
   qdrant:
@@ -171,30 +166,13 @@ services:
       retries: 10
       start_period: 30s
 
-  influxdb:
-    <<: *service-defaults
-    image: influxdb:2.7
-    container_name: ikb-influxdb
-    ports:
-      - "${INFLUXDB_PORT:-8086}:8086"
-    environment:
-      DOCKER_INFLUXDB_INIT_MODE: setup
-      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUXDB_USER:-ikb_admin}
-      DOCKER_INFLUXDB_INIT_PASSWORD: ${INFLUXDB_PASSWORD:-ikb_influx_2024}
-      DOCKER_INFLUXDB_INIT_ORG: ${INFLUXDB_ORG:-factory-ai}
-      DOCKER_INFLUXDB_INIT_BUCKET: ${INFLUXDB_BUCKET:-telemetry}
-      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: ${INFLUXDB_TOKEN:-ikb-influx-dev-token-2024}
-    volumes:
-      - influxdb_data:/var/lib/influxdb2
-    healthcheck:
-      test: ["CMD-SHELL", "influx ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+  # â”€â”€ InfluxDB removed (Phase 3) â€” time-series now served by TimescaleDB â”€â”€â”€â”€â”€â”€
+  # Remove all INFLUXDB_* env vars and the influxdb service block.
+  # Run `make migrate-003` after upgrading to apply the hypertable migration.
 
-  # ──────────────────────────────────────────────
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   # MONITORING
-  # ──────────────────────────────────────────────
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   prometheus:
     <<: *service-defaults
@@ -230,6 +208,7 @@ services:
     <<: *service-defaults
     image: jaegertracing/all-in-one:latest
     container_name: ikb-jaeger
+    profiles: ["tracing"]     # start with: docker compose --profile tracing up
     ports:
       - "${JAEGER_UI_PORT:-16686}:16686"
       - "4317:4317"
@@ -238,9 +217,9 @@ services:
     environment:
       COLLECTOR_OTLP_ENABLED: "true"
 
-  # ──────────────────────────────────────────────
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   # ML PLATFORM
-  # ──────────────────────────────────────────────
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   mlflow:
     <<: *service-defaults
@@ -259,13 +238,15 @@ services:
       --port 5000
       --backend-store-uri postgresql://${POSTGRES_USER:-ikb_admin}:${POSTGRES_PASSWORD:-ikb_secret_2024}@postgres:5432/mlflow
       --default-artifact-root /mlflow/artifacts
+    # Phase 2: MLflow is a background service â€” backend services start independently.
+    # The ML detector gracefully falls back to statistical detection if MLflow is unavailable.
     depends_on:
       postgres:
         condition: service_healthy
 
-  # ──────────────────────────────────────────────
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   # BACKEND SERVICES
-  # ──────────────────────────────────────────────
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   api-gateway:
     <<: *backend-defaults
@@ -281,6 +262,99 @@ services:
       SERVICE_NAME: api_gateway
       SERVICE_PORT: 8000
       OTEL_SERVICE_NAME: api-gateway
+      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-ikb_redis_2024}@redis:6379/0
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:8000}
+      # Route agent/query traffic to the consolidated Knowledge Engine
+      KNOWLEDGE_ENGINE_URL: http://knowledge-engine:8001
+      AGENT_SERVICE_URL: http://knowledge-engine:8001   # legacy fallback alias
+      # Route telemetry queries through the gateway (Phase 4)
+      TELEMETRY_AGGREGATOR_URL: http://telemetry-aggregator:8002
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      knowledge-engine:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  knowledge-engine:
+    <<: *backend-defaults
+    container_name: ikb-knowledge-engine
+    build:
+      context: .
+      # Uses the service-specific Dockerfile (not the generic one)
+      dockerfile: backend/services/knowledge_engine/Dockerfile
+    ports:
+      - "${KNOWLEDGE_ENGINE_PORT:-8001}:8001"
+    environment:
+      SERVICE_NAME: knowledge_engine
+      SERVICE_VERSION: "0.1.0"
+      OTEL_SERVICE_NAME: knowledge-engine
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ikb_admin}:${POSTGRES_PASSWORD:-ikb_secret_2024}@postgres:5432/${POSTGRES_DB:-ikb_main}
+      QDRANT_URL: http://qdrant:6333
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: ${NEO4J_USER:-neo4j}
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:-ikb_neo4j_2024}
+      REDIS_URL: redis://:${REDIS_PASSWORD:-ikb_redis_2024}@redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-gemini-2.5-flash}
+      GEMINI_EMBEDDING_MODEL: ${GEMINI_EMBEDDING_MODEL:-gemini-embedding-001}
+      GEMINI_EMBEDDING_DIM: ${GEMINI_EMBEDDING_DIM:-768}
+      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+      DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID:-default}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  telemetry-aggregator:
+    <<: *backend-defaults
+    container_name: ikb-telemetry-aggregator
+    build:
+      context: .
+      dockerfile: backend/services/telemetry_aggregator/Dockerfile
+    ports:
+      - "${TELEMETRY_PORT:-8002}:8002"
+    environment:
+      SERVICE_NAME: telemetry_aggregator
+      SERVICE_VERSION: "0.1.0"
+      OTEL_SERVICE_NAME: telemetry-aggregator
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://jaeger:4317
+      DATABASE_URL: postgresql://${POSTGRES_USER:-ikb_admin}:${POSTGRES_PASSWORD:-ikb_secret_2024}@postgres:5432/${POSTGRES_DB:-ikb_main}
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      REDIS_URL: redis://:${REDIS_PASSWORD:-ikb_redis_2024}@redis:6379/1
+      KNOWLEDGE_ENGINE_URL: http://knowledge-engine:8001
+      AUTH_ENABLED: ${AUTH_ENABLED:-false}
+      DEFAULT_TENANT_ID: ${DEFAULT_TENANT_ID:-default}
     depends_on:
       postgres:
         condition: service_healthy
@@ -291,117 +365,16 @@ services:
       kafka-init:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD-SHELL", "curl -sf http://localhost:8002/health || exit 1"]
+      interval: 15s
+      timeout: 10s
       retries: 5
-      start_period: 15s
+      start_period: 30s
 
-  rag-service:
-    <<: *backend-defaults
-    container_name: ikb-rag-service
-    build:
-      context: .
-      dockerfile: infrastructure/docker/Dockerfile.service
-      args:
-        SERVICE_NAME: rag_service
-    ports:
-      - "${RAG_SERVICE_PORT:-8001}:8000"
-    environment:
-      SERVICE_NAME: rag_service
-      SERVICE_PORT: 8000
-      OTEL_SERVICE_NAME: rag-service
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
-      qdrant:
-        condition: service_healthy
 
-  agent-service:
-    <<: *backend-defaults
-    container_name: ikb-agent-service
-    build:
-      context: .
-      dockerfile: infrastructure/docker/Dockerfile.service
-      args:
-        SERVICE_NAME: agent_service
-    ports:
-      - "${AGENT_SERVICE_PORT:-8002}:8000"
-    environment:
-      SERVICE_NAME: agent_service
-      SERVICE_PORT: 8000
-      OTEL_SERVICE_NAME: agent-service
-
-  telemetry-service:
-    <<: *backend-defaults
-    container_name: ikb-telemetry-service
-    build:
-      context: .
-      dockerfile: infrastructure/docker/Dockerfile.service
-      args:
-        SERVICE_NAME: telemetry_service
-    ports:
-      - "${TELEMETRY_SERVICE_PORT:-8003}:8000"
-    environment:
-      SERVICE_NAME: telemetry_service
-      SERVICE_PORT: 8000
-      OTEL_SERVICE_NAME: telemetry-service
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
-      influxdb:
-        condition: service_healthy
-
-  knowledge-graph-service:
-    <<: *backend-defaults
-    container_name: ikb-knowledge-graph-service
-    build:
-      context: .
-      dockerfile: infrastructure/docker/Dockerfile.service
-      args:
-        SERVICE_NAME: knowledge_graph_service
-    ports:
-      - "${KG_SERVICE_PORT:-8004}:8000"
-    environment:
-      SERVICE_NAME: knowledge_graph_service
-      SERVICE_PORT: 8000
-      OTEL_SERVICE_NAME: knowledge-graph-service
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-      kafka:
-        condition: service_healthy
-      neo4j:
-        condition: service_healthy
-
-  ingestion-service:
-    <<: *backend-defaults
-    container_name: ikb-ingestion-service
-    build:
-      context: .
-      dockerfile: infrastructure/docker/Dockerfile.service
-      args:
-        SERVICE_NAME: ingestion_service
-    ports:
-      - "${INGESTION_SERVICE_PORT:-8005}:8000"
-    environment:
-      SERVICE_NAME: ingestion_service
-      SERVICE_PORT: 8000
-      OTEL_SERVICE_NAME: ingestion-service
-
-  # ──────────────────────────────────────────────
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
   # FRONTEND
-  # ──────────────────────────────────────────────
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   frontend:
     <<: *service-defaults
@@ -409,6 +382,7 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      target: dev
     ports:
       - "${FRONTEND_PORT:-3000}:3000"
     environment:
@@ -427,18 +401,20 @@ services:
 volumes:
   postgres_data:
   redis_data:
-  zookeeper_data:
-  zookeeper_logs:
+  # zookeeper_data: removed (Phase 2 â€” KRaft mode)
+  # zookeeper_logs: removed (Phase 2 â€” KRaft mode)
   kafka_data:
   qdrant_data:
   neo4j_data:
   neo4j_logs:
-  influxdb_data:
   prometheus_data:
   grafana_data:
   mlflow_data:
+  # influxdb_data: removed (Phase 3 â€” replaced by TimescaleDB)
 
 networks:
   ikb-network:
     driver: bridge
     name: ikb-network
+
+
