@@ -1,6 +1,5 @@
 # Industrial Knowledge Brain (IKB)
 
-**v2.4** — Google Gemini 2.5 Flash · 3-Service Monorepo · TimescaleDB · KRaft Kafka
 
 An enterprise-grade AI platform for industrial factory monitoring, diagnostics, and knowledge management. IKB orchestrates high-frequency sensor streams, parses operational manuals, reasons over a Knowledge Graph, and delivers real-time diagnostics through Retrieval-Augmented Generation (RAG) and agentic ReAct loops.
 
