@@ -1,0 +1,10 @@
+# Shared Python dependencies for Knowledge Engine and Telemetry Aggregator Docker builds.
+orjson==3.10.3
+structlog==24.2.0
+tenacity==8.3.0
+redis==5.0.4
+prometheus-client==0.20.0
+opentelemetry-api==1.24.0
+opentelemetry-sdk==1.24.0
+opentelemetry-exporter-otlp-proto-grpc==1.24.0
+opentelemetry-instrumentation-fastapi==0.45b0
