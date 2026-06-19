@@ -1,0 +1,51 @@
+---
+# =============================================================================
+# IKB — Kubernetes Namespace
+# =============================================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ikb
+  labels:
+    name: ikb
+    environment: production
+---
+# =============================================================================
+# IKB — ConfigMap (non-sensitive cluster-wide configuration)
+# =============================================================================
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ikb-config
+  namespace: ikb
+data:
+  qdrant-url:               "http://qdrant:6333"
+  neo4j-uri:                "bolt://neo4j:7687"
+  kafka-bootstrap-servers:  "kafka:29092"
+  influxdb-url:             "http://influxdb:8086"
+  influxdb-org:             "factory-ai"
+  influxdb-bucket:          "telemetry"
+  otel-endpoint:            "http://jaeger:4317"
+  cors-origins:             "https://ikb.yourdomain.com"
+  environment:              "production"
+  gemini-embedding-model:   "gemini-embedding-001"
+  gemini-embedding-dim:     "768"
+---
+# =============================================================================
+# IKB — Secret Template (replace values before applying with kubectl)
+# Use: kubectl create secret generic ikb-secrets --from-env-file=.env -n ikb
+# =============================================================================
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ikb-secrets
+  namespace: ikb
+type: Opaque
+stringData:
+  database-url:      "postgresql://ikb_user:CHANGE_ME@postgres:5432/ikb_db"
+  redis-url:         "redis://:CHANGE_ME@redis:6379/0"
+  influxdb-token:    "CHANGE_ME"
+  neo4j-user:        "neo4j"
+  neo4j-password:    "CHANGE_ME"
+  gemini-api-key:    "CHANGE_ME"
+  gemini-model:      "gemini-2.5-flash"

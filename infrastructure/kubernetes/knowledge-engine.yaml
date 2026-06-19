@@ -1,0 +1,198 @@
+---
+# =============================================================================
+# Knowledge Engine — Kubernetes Deployment
+# =============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: knowledge-engine
+  namespace: ikb
+  labels:
+    app: knowledge-engine
+    component: backend
+    version: "0.1.0"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: knowledge-engine
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: knowledge-engine
+        component: backend
+        version: "0.1.0"
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8001"
+        prometheus.io/path: "/metrics"
+    spec:
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: knowledge-engine
+          image: ikb/knowledge-engine:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8001
+              protocol: TCP
+          env:
+            - name: SERVICE_NAME
+              value: knowledge_engine
+            - name: SERVICE_VERSION
+              value: "0.1.0"
+            - name: ENVIRONMENT
+              value: production
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ikb-secrets
+                  key: database-url
+            - name: QDRANT_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: ikb-config
+                  key: qdrant-url
+            - name: NEO4J_URI
+              valueFrom:
+                configMapKeyRef:
+                  name: ikb-config
+                  key: neo4j-uri
+            - name: NEO4J_USER
+              valueFrom:
+                secretKeyRef:
+                  name: ikb-secrets
+                  key: neo4j-user
+            - name: NEO4J_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: ikb-secrets
+                  key: neo4j-password
+            - name: GEMINI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: ikb-secrets
+                  key: gemini-api-key
+            - name: GEMINI_MODEL
+              valueFrom:
+                secretKeyRef:
+                  name: ikb-secrets
+                  key: gemini-model
+            - name: GEMINI_EMBEDDING_MODEL
+              valueFrom:
+                configMapKeyRef:
+                  name: ikb-config
+                  key: gemini-embedding-model
+            - name: GEMINI_EMBEDDING_DIM
+              valueFrom:
+                configMapKeyRef:
+                  name: ikb-config
+                  key: gemini-embedding-dim
+            - name: KAFKA_BOOTSTRAP_SERVERS
+              valueFrom:
+                configMapKeyRef:
+                  name: ikb-config
+                  key: kafka-bootstrap-servers
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: ikb-secrets
+                  key: redis-url
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              valueFrom:
+                configMapKeyRef:
+                  name: ikb-config
+                  key: otel-endpoint
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "512Mi"
+            limits:
+              cpu: "2000m"
+              memory: "2Gi"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            failureThreshold: 3
+            successThreshold: 1
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8001
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]
+---
+# =============================================================================
+# Knowledge Engine — Service
+# =============================================================================
+apiVersion: v1
+kind: Service
+metadata:
+  name: knowledge-engine
+  namespace: ikb
+  labels:
+    app: knowledge-engine
+spec:
+  selector:
+    app: knowledge-engine
+  ports:
+    - name: http
+      protocol: TCP
+      port: 8001
+      targetPort: 8001
+  type: ClusterIP
+---
+# =============================================================================
+# Knowledge Engine — HorizontalPodAutoscaler
+# =============================================================================
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: knowledge-engine-hpa
+  namespace: ikb
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: knowledge-engine
+  minReplicas: 2
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
