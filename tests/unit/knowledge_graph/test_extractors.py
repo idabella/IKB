@@ -55,7 +55,7 @@ async def test_llm_extractor_cache_hit():
     cached_json = '{"relations": [{"source": "Motor", "relation_type": "CAUSED_BY", "target": "Bearing Wear", "confidence": 0.9, "sentence_span": "Motor failed due to bearing wear."}]}'
     mock_redis.get.return_value = cached_json
     
-    # Do not set OPENAI_API_KEY, just use cache
+    # Do not set GEMINI_API_KEY, just use cache
     llm_extractor = LLMExtractor(mock_redis)
     # Patch the client check so it thinks it's initialized
     llm_extractor.client = True 
