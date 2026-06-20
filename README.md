@@ -1,6 +1,8 @@
 <div align="center">
 
-# 🏭 Industrial Knowledge Brain
+<img src="assets/ikb.png" alt="Industrial Knowledge Brain Logo" width="180"/>
+
+# Industrial Knowledge Brain
 
 **Real-time IIoT monitoring platform with AI-powered diagnostics**
 
